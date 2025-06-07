@@ -1,0 +1,2 @@
+[registries]
+ic = { index = "https://github.com/dfinity/ic-registry.git" } 
