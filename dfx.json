@@ -1,0 +1,63 @@
+{
+    "canisters": {
+        "internet_identity": {
+            "type": "custom",
+            "candid": "https://github.com/dfinity/internet-identity/releases/latest/download/internet_identity.did",
+            "wasm": "https://github.com/dfinity/internet-identity/releases/latest/download/internet_identity_dev.wasm.gz",
+            "init_arg": "(opt record { captcha_config = opt record { max_unsolved_captchas= 50:nat64; captcha_trigger = variant {Static = variant {CaptchaDisabled}}}})",
+            "remote": {
+                "candid": "https://github.com/dfinity/internet-identity/releases/latest/download/internet_identity.did",
+                "id": {
+                    "ic": "rdmx6-jaaaa-aaaaa-aaadq-cai"
+                }
+            }
+        },
+        "blueband_rust": {
+            "type": "custom",
+            "candid": "/Users/godson/Desktop/blueband-rust/blueband_rust.did",
+            "wasm": "/Users/godson/Desktop/blueband-rust/target/wasm32-unknown-unknown/release/blueband_rust.wasm"
+        },
+        "clanopedia_backend": {
+            "type": "rust",
+            "package": "clanopedia_backend",
+            "candid": "src/clanopedia_backend/clanopedia_backend.did"
+        },
+        "clanopedia_frontend": {
+            "source": [
+                "src/clanopedia_frontend/dist"
+            ],
+            "type": "assets",
+            "dependencies": [
+                "internet_identity",
+                "clanopedia_backend",
+                "blueband_rust"
+            ],
+            "build": "(cd src/clanopedia_frontend && VITE_MODE=\"$(echo ${DFX_NETWORK:-production} | sed 's/local/development/')\" npm run build)"
+        },
+        "test_token": {
+            "type": "custom",
+            "wasm": "/Users/godson/Desktop/foodfolio/blueband-db/.dfx/local/canisters/test_token/test_token.wasm",
+            "candid": "/Users/godson/Desktop/foodfolio/blueband-db/.dfx/local/canisters/test_token/test_token.did"
+        }
+    },
+    "defaults": {
+        "build": {
+            "packtool": "mops sources",
+            "args": ""
+        }
+    },
+    "networks": {
+        "local": {
+            "bind": "127.0.0.1:4943",
+            "type": "ephemeral"
+        },
+        "ic": {
+            "providers": [
+                "https://ic0.app"
+            ],
+            "type": "persistent"
+        }
+    },
+    "output_env_file": ".env",
+    "version": 1
+}

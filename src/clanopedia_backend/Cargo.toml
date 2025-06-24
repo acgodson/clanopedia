@@ -9,17 +9,26 @@ name = "clanopedia_backend"
 crate-type = ["cdylib"]
 
 [dependencies]
-candid = "0.10.6"
-ic-cdk = "0.12.0"
-ic-cdk-macros = "0.8.0"
+candid = "0.10"
+ic-cdk = "0.15"
+ic-cdk-macros = "0.15"
 ic-stable-structures = "0.6.8"
-sha2 = "0.10.8"
+sha2 = { version = "0.10.8", default-features = false }
 hex = "0.4.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 icrc-ledger-types = "0.1.8"
-num-traits = "0.2"
+num-traits = { version = "0.2", default-features = false }
 getrandom = { version = "0.2", features = ["custom"] }
+chrono = { version = "0.4", features = ["serde"], default-features = false }
+encoding_rs = { version = "0.8.33", default-features = false }
+lopdf = "0.32"
+quick-xml = { version = "0.31.0", default-features = false }
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+
+[dependencies.wasm-bindgen]
+version = "0.2.100"
+optional = true
 
 [features]
 default = []
@@ -30,4 +39,3 @@ lto = true
 panic = "abort"
 strip = true
 codegen-units = 1
-

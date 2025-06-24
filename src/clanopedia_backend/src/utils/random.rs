@@ -1,4 +1,4 @@
-// src/clanopedia_backend/src/random.rs - Simple getrandom implementation for IC
+// src/clanopedia_backend/src/utils/random.rs - Simple getrandom implementation for IC
 
 use getrandom::{register_custom_getrandom, Error};
 

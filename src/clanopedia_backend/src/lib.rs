@@ -1,83 +1,110 @@
-// src/clanopedia_backend/src/lib.rs - Final fixes
+// src/clanopedia_backend/src/lib.rs
 
 use candid::Principal;
+use getrandom::getrandom;
 use ic_cdk::api::caller;
-use ic_cdk::{query, update};
-use ic_cdk_macros::*;
+use ic_cdk::api::management_canister::http_request::{HttpResponse, TransformArgs};
 use ic_cdk::api::time;
-use std::collections::HashMap;
+use ic_cdk::{query, update};
+use ic_stable_structures::{
+    memory_manager::{MemoryId, MemoryManager},
+    DefaultMemoryImpl, StableBTreeMap,
+};
+use std::cell::RefCell;
 
-mod blueband_client;
-mod blueband_interface;
+mod cycles;
+mod external;
+mod extractor;
 mod governance;
 mod storage;
-mod token_interface;
 mod types;
-mod cycles;
-mod random;
+mod utils;
 
-// Re-export specific types and functions instead of using glob imports
+// Re-export specific types and functions
 pub use types::{
-    Collection, Proposal, ProposalType, Vote, ClanopediaError, ClanopediaResult,
-    CollectionConfig, DocumentRequest, SearchResult, BluebandDocument, BluebandConfig,
-    GovernanceModelConfig, CollectionId, ProposalId, DocumentId, GovernanceModel,
-    ProposalStatus, PROPOSAL_DURATION_NANOS,
+    BluebandConfig, BluebandDocument, ClanopediaError, ClanopediaResult, Collection,
+    CollectionConfig, CollectionId, DocumentId, DocumentRequest, GovernanceModel,
+    GovernanceModelConfig, Proposal, ProposalId, ProposalStatus, ProposalType, SearchResult, Vote,
+    PROPOSAL_DURATION_NANOS,
 };
 
-pub use blueband_interface::{
-    BluebandService, BluebandResult, Collection as BluebandCollection,
-    DocumentMetadata, SearchRequest, MemorySearchResult, VectorMatch,
+pub use external::blueband::{get_collection_metrics, CollectionMetrics};
+pub use external::{
+    add_document_to_blueband, create_blueband_collection, delete_collection, delete_document,
+    embed_existing_document, fund_blueband_cycles, get_blueband_cycles_balance,
+    get_document_content_from_blueband, get_document_metadata, get_token_balance,
+    get_token_total_supply, transfer_genesis_admin, BluebandResult, BluebandService,
+    DocumentMetadata, MemorySearchResult, SearchRequest, TokenResult, TokenService, VectorMatch,
 };
 
-pub use cycles::{
-    CyclesStatus, estimate_embedding_cost,
+pub use extractor::{
+    AddDocumentsResult, DocumentAction, ExtractionInfo, ExtractionProgress, ExtractionResponse,
+    ExtractionResult, ExtractionSource, ExtractionStatus, Extractor, FileExtractionConfig,
+    FileType, UrlType, YouTubeVideoInfo,
 };
+
+pub use cycles::{estimate_embedding_cost, CyclesStatus};
+
+use crate::external::blueband::AddDocumentRequest;
+
+// use crate::extractor::{};
+
+type Memory = ic_stable_structures::memory_manager::VirtualMemory<DefaultMemoryImpl>;
+
+// Memory manager for stable storage
+thread_local! {
+    static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> = RefCell::new(
+        MemoryManager::init(DefaultMemoryImpl::default())
+    );
+}
 
 // Global state for Blueband canister ID
 thread_local! {
-    static BLUEBAND_CANISTER_ID: std::cell::RefCell<Option<Principal>> = 
-        std::cell::RefCell::new(None);
+    static BLUEBAND_CANISTER_ID: RefCell<StableBTreeMap<(), Principal, Memory>> = RefCell::new(
+        StableBTreeMap::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(2)))
+        )
+    );
 }
 
-fn set_blueband_canister_id(canister_id: Principal) {
+pub fn set_blueband_canister_id(canister_id: Principal) {
     BLUEBAND_CANISTER_ID.with(|id| {
-        *id.borrow_mut() = Some(canister_id);
+        id.borrow_mut().insert((), canister_id);
     });
 }
 
 pub fn get_blueband_canister_id() -> ClanopediaResult<Principal> {
     BLUEBAND_CANISTER_ID.with(|id| {
-        id.borrow()
-            .clone()
-            .ok_or_else(|| ClanopediaError::InvalidInput("Blueband canister not initialized".to_string()))
+        id.borrow().get(&()).ok_or_else(|| {
+            ClanopediaError::InvalidInput("Blueband canister not initialized".to_string())
+        })
     })
 }
 
-// Constants
-const MIN_CYCLES_BALANCE: u64 = 1_000_000_000; // 1B cycles minimum
-
-// ============================
-// INITIALIZATION
-// ============================
-
-#[init]
-fn init() {
-    // Initialize can be empty for now since we use thread_local storage
-}
-
-#[pre_upgrade]
-fn pre_upgrade() {
-    // Save state to stable storage if needed
-}
-
-#[post_upgrade]
-fn post_upgrade() {
-    // Load state from stable storage if needed
+// Helper function to check if a user is an admin of a collection
+fn is_admin(collection_id: &str, user: Principal) -> bool {
+    match storage::get_collection(&collection_id.to_string()) {
+        Ok(collection) => collection.admins.contains(&user),
+        Err(_) => false,
+    }
 }
 
 // ============================
 // COLLECTION MANAGEMENT
 // ============================
+
+#[update]
+fn configure_blueband_canister(canister_id: Principal) -> ClanopediaResult<()> {
+    // Only allow if not already set (for safety)
+    if BLUEBAND_CANISTER_ID.with(|id| id.borrow().contains_key(&())) {
+        return Err(ClanopediaError::InvalidOperation(
+            "Blueband canister already configured".to_string(),
+        ));
+    }
+
+    set_blueband_canister_id(canister_id);
+    Ok(())
+}
 
 #[query]
 fn get_collection(collection_id: String) -> ClanopediaResult<Collection> {
@@ -90,35 +117,122 @@ fn list_collections() -> ClanopediaResult<Vec<Collection>> {
 }
 
 #[update]
-async fn create_collection_endpoint(
-    collection_id: CollectionId,
-    config: CollectionConfig,
-) -> ClanopediaResult<CollectionId> {
+async fn create_collection_endpoint(config: CollectionConfig) -> ClanopediaResult<CollectionId> {
     let caller = ic_cdk::caller();
-    storage::create_collection(&collection_id, config, caller)?;
+
+    // Generate a random number using getrandom
+    let mut random_bytes = [0u8; 4];
+    getrandom(&mut random_bytes).map_err(|e| {
+        ClanopediaError::InvalidInput(format!("Failed to generate random bytes: {}", e))
+    })?;
+    let random_number = u32::from_be_bytes(random_bytes);
+
+    // Generate a unique collection ID that's shorter and meets Blueband's requirements
+    // Use first 8 chars of caller, last 4 digits of timestamp, and 4 random hex chars
+    let caller_short = caller.to_string().chars().take(8).collect::<String>();
+    let timestamp = time().to_string();
+    let timestamp_short = timestamp
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    let random_hex = format!("{:04x}", random_number % 0xFFFF);
+    let collection_id = format!("col_{}_{}_{}", caller_short, timestamp_short, random_hex);
+
+    // Create collection in Blueband first
+    let blueband_collection = create_blueband_collection(
+        collection_id.clone(),
+        config.name.clone(),
+        config.description.clone(),
+    )
+    .await
+    .map_err(|e| ClanopediaError::BluebandError(e.to_string()))?;
+
+    // Convert string representations to Principal objects for validation
+    let admins: Result<Vec<Principal>, _> = config
+        .admins
+        .iter()
+        .map(Principal::from_text)
+        .collect();
+
+    let governance_token = config
+        .governance_token
+        .as_ref()
+        .map(Principal::from_text)
+        .transpose()
+        .map_err(|e| {
+            ClanopediaError::InvalidInput(format!("Invalid governance token principal: {}", e))
+        })?;
+
+    // Create collection in Clanopedia storage with Blueband ID
+    let mut collection_config = config;
+
+    // If any principal is invalid, use just the caller
+    if admins.is_err() {
+        collection_config.admins = vec![caller.to_string()];
+    } else {
+        let admins = admins.unwrap();
+        if admins.is_empty() {
+            collection_config.admins = vec![caller.to_string()];
+        }
+    }
+
+    // Update the config with validated principals
+    collection_config.governance_token = governance_token.map(|p| p.to_string());
+
+    storage::create_collection(&collection_id, collection_config, caller)?;
+
+    // Update the collection with Blueband ID
+    let mut collection = storage::get_collection(&collection_id)?;
+    collection.blueband_collection_id = blueband_collection.id;
+    storage::update_collection(&collection_id, &collection)?;
+
     Ok(collection_id)
 }
 
 #[update]
 async fn update_collection(
     collection_id: CollectionId,
-    config: CollectionConfig,
+    mut config: CollectionConfig,
 ) -> ClanopediaResult<()> {
     let caller = ic_cdk::caller();
     let collection = storage::get_collection(&collection_id)?;
-    
+
     if !collection.admins.contains(&caller) {
         return Err(ClanopediaError::NotAuthorized);
     }
 
-    let mut updated_collection = collection;
+    // Convert string representations to Principal objects for validation
+    let admins: Result<Vec<Principal>, _> = config
+        .admins
+        .iter()
+        .map(|p| Principal::from_text(p))
+        .collect();
+
+    let governance_token = config
+        .governance_token
+        .as_ref()
+        .map(|t| Principal::from_text(t))
+        .transpose()
+        .map_err(|e| {
+            ClanopediaError::InvalidInput(format!("Invalid governance token principal: {}", e))
+        })?;
+
+    // If any principal is invalid, keep existing admins
+    if admins.is_err() {
+        config.admins = collection.admins.iter().map(|p| p.to_string()).collect();
+    }
+
+    let mut updated_collection = collection.clone();
     updated_collection.name = config.name;
     updated_collection.description = config.description;
-    updated_collection.admins = config.admins;
+    updated_collection.admins = admins.unwrap_or_else(|_| collection.admins.clone());
     updated_collection.threshold = config.threshold;
-    updated_collection.governance_token = config.governance_token;
+    updated_collection.governance_token = governance_token;
     updated_collection.governance_model = config.governance_model;
-    updated_collection.members = config.members;
     updated_collection.quorum_threshold = config.quorum_threshold;
     updated_collection.is_permissionless = config.is_permissionless;
     updated_collection.updated_at = time();
@@ -138,54 +252,14 @@ async fn delete_collection_endpoint(collection_id: CollectionId) -> ClanopediaRe
 // ============================
 
 #[update]
-async fn add_document(
+async fn get_document_endpoint(
     collection_id: CollectionId,
-    document: DocumentRequest,
-) -> ClanopediaResult<String> {
-    let caller = ic_cdk::caller();
-    
-    // Check if caller is admin
-    if !is_admin(&collection_id, caller) {
-        return Err(ClanopediaError::Unauthorized(
-            "Only admins can add documents".to_string(),
-        ));
-    }
-    
-    // Add document to Blueband (without embedding)
-    match blueband_client::add_document_to_blueband(&collection_id, document).await {
-        Ok(metadata) => Ok(metadata.id),
-        Err(e) => Err(ClanopediaError::BluebandError(e)),
-    }
-}
-
-#[update]
-async fn create_embed_proposal(
-    collection_id: CollectionId,
-    documents: Vec<String>,
-) -> ClanopediaResult<ProposalId> {
-    let caller = caller();
-    validate_clanopedia_operation("create_proposal")?;
-    let _collection = storage::get_collection(&collection_id)?;
-    if !is_admin(&collection_id, caller) {
-        return Err(ClanopediaError::NotAuthorized);
-    }
-    let proposal_type = ProposalType::EmbedDocument { documents };
-    governance::create_proposal(&collection_id, proposal_type, caller, "Embed documents".to_string()).await
-}
-
-#[update]
-async fn create_batch_embed_proposal(
-    collection_id: CollectionId,
-    document_ids: Vec<String>,
-) -> ClanopediaResult<ProposalId> {
-    let caller = caller();
-    validate_clanopedia_operation("create_proposal")?;
-    let _collection = storage::get_collection(&collection_id)?;
-    if !is_admin(&collection_id, caller) {
-        return Err(ClanopediaError::NotAuthorized);
-    }
-    let proposal_type = ProposalType::BatchEmbed { document_ids };
-    governance::create_proposal(&collection_id, proposal_type, caller, "Batch embed documents".to_string()).await
+    document_id: DocumentId,
+) -> ClanopediaResult<Option<String>> {
+    let collection = storage::get_collection(&collection_id)?;
+    get_document_content_from_blueband(&collection.blueband_collection_id, &document_id)
+        .await
+        .map_err(ClanopediaError::BluebandError)
 }
 
 // ============================
@@ -193,13 +267,8 @@ async fn create_batch_embed_proposal(
 // ============================
 
 #[query]
-fn get_proposal(proposal_id: String) -> ClanopediaResult<Proposal> {
-    governance::get_proposal(&proposal_id)
-}
-
-#[query]
-fn get_active_proposals_endpoint(collection_id: String) -> ClanopediaResult<Vec<Proposal>> {
-    governance::get_active_proposals(&collection_id)
+fn get_proposals_endpoint(collection_id: String) -> ClanopediaResult<Vec<Proposal>> {
+    governance::get_proposals(&collection_id)
 }
 
 #[update]
@@ -222,13 +291,24 @@ async fn vote_on_proposal_endpoint(
 }
 
 #[update]
-async fn execute_proposal_endpoint(collection_id: String, proposal_id: String) -> ClanopediaResult<()> {
+async fn execute_proposal_endpoint(
+    collection_id: String,
+    proposal_id: String,
+) -> ClanopediaResult<()> {
     governance::execute_proposal(&collection_id, &proposal_id).await
 }
 
 #[query]
-fn get_proposal_status_endpoint(collection_id: String, proposal_id: String) -> ClanopediaResult<ProposalStatus> {
+fn get_proposal_status_endpoint(
+    collection_id: String,
+    proposal_id: String,
+) -> ClanopediaResult<ProposalStatus> {
     governance::get_proposal_status(&collection_id, proposal_id)
+}
+
+#[query]
+fn can_execute_directly_endpoint(collection_id: String) -> ClanopediaResult<bool> {
+    governance::can_execute_directly(&collection_id)
 }
 
 // ============================
@@ -236,109 +316,368 @@ fn get_proposal_status_endpoint(collection_id: String, proposal_id: String) -> C
 // ============================
 
 #[update]
-async fn create_admin_proposal(collection_id: String, new_admin: Principal) -> ClanopediaResult<ProposalId> {
+async fn create_admin_proposal(
+    collection_id: String,
+    new_admin: Principal,
+) -> ClanopediaResult<ProposalId> {
     let caller = caller();
     let proposal_type = ProposalType::AddAdmin { admin: new_admin };
-    governance::create_proposal(&collection_id, proposal_type, caller, "Add new admin".to_string()).await
+    governance::create_proposal(
+        &collection_id,
+        proposal_type,
+        caller,
+        "Add new admin".to_string(),
+    )
+    .await
 }
 
 #[update]
-async fn create_remove_admin_proposal(collection_id: String, admin_to_remove: Principal) -> ClanopediaResult<ProposalId> {
+async fn create_remove_admin_proposal(
+    collection_id: String,
+    admin_to_remove: Principal,
+) -> ClanopediaResult<ProposalId> {
     let caller = caller();
-    let proposal_type = ProposalType::RemoveAdmin { admin: admin_to_remove };
-    governance::create_proposal(&collection_id, proposal_type, caller, "Remove admin".to_string()).await
-}
-
-#[update]
-async fn create_threshold_proposal(collection_id: String, new_threshold: u32) -> ClanopediaResult<ProposalId> {
-    let caller = caller();
-    let proposal_type = ProposalType::ChangeThreshold { new_threshold };
-    governance::create_proposal(&collection_id, proposal_type, caller, "Change threshold".to_string()).await
-}
-
-#[update]
-async fn create_transfer_genesis_proposal(collection_id: String, new_genesis: Principal) -> ClanopediaResult<ProposalId> {
-    let caller = caller();
-    let proposal_type = ProposalType::TransferGenesis { new_genesis };
-    governance::create_proposal(&collection_id, proposal_type, caller, "Transfer genesis ownership".to_string()).await
-}
-
-#[update]
-async fn create_governance_model_proposal(collection_id: String, new_model: GovernanceModel) -> ClanopediaResult<ProposalId> {
-    let caller = caller();
-    let proposal_type = ProposalType::ChangeGovernanceModel { model: new_model };
-    governance::create_proposal(&collection_id, proposal_type, caller, "Change governance model".to_string()).await
+    let proposal_type = ProposalType::RemoveAdmin {
+        admin: admin_to_remove,
+    };
+    governance::create_proposal(
+        &collection_id,
+        proposal_type,
+        caller,
+        "Remove admin".to_string(),
+    )
+    .await
 }
 
 // ============================
-// SEARCH OPERATIONS (Direct to Blueband)
+//  EXTRACTOR OPERATIONS
 // ============================
 
-#[query]
-async fn search_documents(
-    collection_id: CollectionId,
-    query: String,
-    limit: Option<u32>,
-) -> ClanopediaResult<Vec<SearchResult>> {
+#[update]
+async fn extract_from_file(
+    file_data: Vec<u8>,
+    filename: String,
+    collection_id: String,
+) -> ClanopediaResult<ExtractionResponse> {
+    let caller = ic_cdk::caller();
+
+    // Verify the caller is an admin of the collection
     let collection = storage::get_collection(&collection_id)?;
-    blueband_client::search_documents_in_blueband(&collection.blueband_collection_id, &query, limit)
-        .await
-        .map_err(|e| ClanopediaError::BluebandError(e))
-}
+    if !collection.admins.contains(&caller) {
+        return Err(ClanopediaError::NotAuthorized);
+    }
 
-#[query]
-async fn get_document(
-    collection_id: CollectionId,
-    document_id: DocumentId,
-) -> ClanopediaResult<Option<String>> {
-    let collection = storage::get_collection(&collection_id)?;
-    blueband_client::get_document_content_from_blueband(&collection.blueband_collection_id, &document_id)
-        .await
-        .map_err(|e| ClanopediaError::BluebandError(e))
-}
+    ic_cdk::println!(
+        "File extraction request from {}: {} ({} bytes) -> {}",
+        caller,
+        filename,
+        file_data.len(),
+        collection_id
+    );
 
-#[query]
-async fn get_document_metadata(
-    collection_id: CollectionId,
-    document_id: DocumentId,
-) -> ClanopediaResult<Option<crate::blueband_interface::DocumentMetadata>> {
-    let collection = storage::get_collection(&collection_id)?;
-    blueband_client::get_document_metadata(collection.blueband_collection_id, document_id)
-        .await
-        .map_err(|e| ClanopediaError::BluebandError(e))
-}
+    // Extract content
+    let documents = extractor::Extractor::extract_from_file(file_data, filename, collection_id)?;
 
-// ============================
-// CYCLES MANAGEMENT
-// ============================
+    // File extraction is always complete (no pagination)
+    let extraction_info = ExtractionInfo::for_file_extraction(documents.len() as u32);
 
-#[query]
-async fn check_cycles_status_endpoint() -> ClanopediaResult<CyclesStatus> {
-    cycles::check_cycles_status().await
-}
-
-#[query]
-async fn get_cycles_health() -> ClanopediaResult<String> {
-    cycles::get_cycles_health_report().await
-}
-
-#[query]
-async fn get_funding_estimate(planned_docs: u32) -> ClanopediaResult<String> {
-    cycles::get_funding_recommendation(planned_docs).await
+    Ok(ExtractionResponse {
+        documents,
+        extraction_info,
+    })
 }
 
 #[update]
-async fn transfer_cycles_to_blueband(amount: u64) -> ClanopediaResult<()> {
-    cycles::fund_blueband_canister(amount).await
+async fn extract_from_url(
+    url: String,
+    collection_id: String,
+    api_key: Option<String>,
+) -> ClanopediaResult<ExtractionResponse> {
+    let caller = ic_cdk::caller();
+
+    // Add detailed logging for debugging
+    ic_cdk::println!(
+        "URL extraction request - Caller: {}, Collection: {}, URL: {}",
+        caller,
+        collection_id,
+        url
+    );
+
+    let collection = storage::get_collection(&collection_id)?;
+
+    // Log collection admins and caller for debugging
+    ic_cdk::println!(
+        "Collection admins: {:?}, Caller: {}",
+        collection.admins,
+        caller
+    );
+
+    if !collection.admins.contains(&caller) {
+        ic_cdk::println!(
+            "Authorization failed - Caller {} not in admins list: {:?}",
+            caller,
+            collection.admins
+        );
+        return Err(ClanopediaError::NotAuthorized);
+    }
+
+    ic_cdk::println!(
+        "Authorization successful - proceeding with extraction for {}",
+        caller
+    );
+
+    let documents =
+        extractor::Extractor::extract_from_url(url.clone(), collection_id.clone(), api_key).await?;
+
+    let progress = extractor::Extractor::get_progress(&collection_id, &url);
+
+    let extraction_info = if let Some(progress) = progress {
+        ExtractionInfo::from_progress(&progress)
+    } else {
+        ExtractionInfo::for_file_extraction(documents.len() as u32)
+    };
+
+    Ok(ExtractionResponse {
+        documents,
+        extraction_info,
+    })
+}
+
+#[update]
+async fn add_extracted_documents(
+    collection_id: String,
+    documents: Vec<AddDocumentRequest>,
+) -> ClanopediaResult<AddDocumentsResult> {
+    let caller = ic_cdk::caller();
+
+    // Verify the caller is an admin of the collection
+    let collection = storage::get_collection(&collection_id)?;
+    if !collection.admins.contains(&caller) {
+        return Err(ClanopediaError::NotAuthorized);
+    }
+
+    if documents.is_empty() {
+        return Err(ClanopediaError::InvalidInput(
+            "No documents to add".to_string(),
+        ));
+    }
+
+    ic_cdk::println!(
+        "Adding {} extracted documents to collection {}",
+        documents.len(),
+        collection_id
+    );
+
+    let total_docs = documents.len();
+    let mut document_ids = Vec::new();
+    let mut processed_count = 0;
+
+    // Add documents to Blueband
+    for doc_request in documents {
+        let title = doc_request.title.clone();
+        ic_cdk::println!("Adding document: {}", title);
+
+        // Convert AddDocumentRequest to DocumentRequest
+        let document_request = DocumentRequest {
+            title: doc_request.title,
+            content: doc_request.content,
+            content_type: doc_request.content_type,
+            source_url: doc_request.source_url,
+            author: doc_request.author,
+            tags: doc_request.tags,
+        };
+
+        let metadata =
+            add_document_to_blueband(&collection.blueband_collection_id, document_request)
+                .await
+                .map_err(|e| {
+                    ic_cdk::println!("Error adding document {}: {}", title, e);
+                    ClanopediaError::BluebandError(e)
+                })?;
+
+        document_ids.push(metadata.id.clone());
+        processed_count += 1;
+        ic_cdk::println!(
+            "Successfully added document: {} ({}/{})",
+            metadata.id,
+            processed_count,
+            total_docs
+        );
+    }
+
+    // Create proposal for embedding
+    let doc_count = document_ids.len();
+    let proposal_type = ProposalType::BatchEmbed {
+        document_ids: document_ids.clone(),
+    };
+
+    let description = format!(
+        "Embed {} extracted documents into the collection. Documents: [{}]",
+        doc_count,
+        document_ids
+            .iter()
+            .take(3) // Show first 3 IDs
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let proposal_id = governance::create_proposal(
+        &collection_id,
+        proposal_type,
+        caller,
+        description
+    ).await?;
+
+    // Clone proposal_id for the message
+    let proposal_id_clone = proposal_id.clone();
+
+    // Get governance type for the message
+    let governance_type = match collection.governance_model {
+        GovernanceModel::Permissionless => "permissionless",
+        GovernanceModel::Multisig => "multisig",
+        GovernanceModel::TokenBased => "token-based",
+        GovernanceModel::SnsIntegrated => "SNS-integrated",
+    };
+
+    // Create the result with the cloned proposal_id
+    let result = AddDocumentsResult {
+        document_ids,
+        proposal_id: Some(proposal_id_clone.clone()),
+        action: DocumentAction::ProposalCreated,
+        message: format!(
+            "Successfully added {} documents. Proposal {} created for {} governance approval",
+            doc_count, proposal_id_clone, governance_type
+        ),
+    };
+
+    Ok(result)
+}
+
+#[update]
+fn cleanup_extraction_progress_endpoint(
+    collection_id: String,
+    url: String,
+) -> ClanopediaResult<()> {
+    let caller = ic_cdk::caller();
+
+    // Verify the caller is an admin of the collection
+    let collection = storage::get_collection(&collection_id)?;
+    if !collection.admins.contains(&caller) {
+        return Err(ClanopediaError::NotAuthorized);
+    }
+
+    // Only allow cleanup of completed/failed extractions
+    if let Some(progress) = extractor::Extractor::get_progress(&collection_id, &url) {
+        match progress.status {
+            ExtractionStatus::Completed | ExtractionStatus::Failed(_) => {
+                extractor::Extractor::remove_progress(&collection_id, &url);
+                Ok(())
+            }
+            _ => Err(ClanopediaError::InvalidOperation(
+                "Cannot cleanup active or paused extractions".to_string(),
+            )),
+        }
+    } else {
+        Err(ClanopediaError::InvalidInput(
+            "No extraction found for this URL and collection".to_string(),
+        ))
+    }
 }
 
 // ============================
-// UTILITY FUNCTIONS
+// EXTRACTION STATUS ENDPOINTS
 // ============================
 
+/// Get extraction progress for a specific URL/collection
+#[query]
+fn get_extraction_progress(collection_id: String, url: String) -> Option<ExtractionProgress> {
+    extractor::Extractor::get_progress(&collection_id, &url)
+}
+
+/// Get all active extractions for a collection
+#[query]
+fn get_collection_extractions_endpoint(collection_id: String) -> Vec<ExtractionProgress> {
+    extractor::Extractor::get_collection_extractions(collection_id)
+}
+
+/// Get extraction statistics
+#[query]
+fn get_extraction_stats_endpoint() -> (u64, u64, u64) {
+    extractor::get_extraction_stats()
+}
+
+/// Clean up old completed extractions (system maintenance)
 #[update]
-async fn cleanup_expired_proposals_endpoint(collection_id: String) -> ClanopediaResult<u32> {
-    governance::cleanup_expired_proposals(&collection_id).await
+fn cleanup_old_extractions_endpoint() -> u32 {
+    extractor::cleanup_old_extractions()
+}
+
+// ============================
+// EXTRACTION INFO ENDPOINTS
+// ============================
+
+#[query]
+fn get_supported_file_types() -> Vec<String> {
+    vec![
+        "txt".to_string(),
+        "md".to_string(),
+        "markdown".to_string(),
+        "pdf".to_string(),
+        "docx".to_string(),
+    ]
+}
+
+#[query]
+fn get_supported_url_types() -> Vec<String> {
+    vec![
+        "YouTube playlists".to_string(),
+        "GitHub markdown files".to_string(),
+    ]
+}
+
+#[query]
+fn get_extraction_limits() -> String {
+    format!(
+        "File size limit: {} MB\nContent size limit: {} MB\nYouTube playlist limit: 50 videos per batch\nGitHub file limit: 2 MB",
+        10,
+        10, 
+    )
+}
+
+#[update]
+async fn sync_sns_proposal_status_and_update_endpoint(
+    collection_id: String,
+    proposal_id: String,
+) -> ClanopediaResult<()> {
+    crate::governance::sync_sns_proposal_status_and_update(&collection_id, &proposal_id).await
+}
+
+#[query]
+fn is_sns_integrated_endpoint(collection_id: String) -> ClanopediaResult<bool> {
+    let collection = storage::get_collection(&collection_id)?;
+    Ok(collection.governance_model == GovernanceModel::SnsIntegrated)
+}
+
+#[query]
+fn get_sns_governance_canister_endpoint(collection_id: String) -> ClanopediaResult<Option<Principal>> {
+    let collection = storage::get_collection(&collection_id)?;
+    
+    if collection.governance_model == GovernanceModel::SnsIntegrated {
+        Ok(collection.sns_governance_canister)
+    } else {
+        Ok(None)
+    }
+}
+
+#[update]
+fn link_sns_proposal_id_endpoint(
+    collection_id: String,
+    proposal_id: String,
+    sns_proposal_id: u64,
+) -> ClanopediaResult<()> {
+    let caller = ic_cdk::caller();
+    crate::governance::link_sns_proposal_id(&collection_id, &proposal_id, sns_proposal_id, caller)
 }
 
 #[query]
@@ -346,123 +685,45 @@ fn is_admin_check(collection_id: CollectionId, user: Principal) -> bool {
     is_admin(&collection_id, user)
 }
 
-#[query]
-fn get_caller() -> Principal {
-    ic_cdk::caller()
-}
-
-#[query]
-fn get_clanopedia_canister_cycles() -> u64 {
-    ic_cdk::api::canister_balance()
-}
-
-// ============================
-// HEALTH CHECK
-// ============================
-
-#[query]
-fn health_check() -> String {
-    "Clanopedia Backend is running".to_string()
-}
-
-#[query]
-async fn full_health_check() -> String {
-    let clanopedia_cycles = ic_cdk::api::canister_balance();
-    let blueband_status = match get_blueband_canister_id() {
-        Ok(_blueband_canister) => {
-            "(cycles check stubbed)".to_string()
-        },
-        Err(_) => "❌ Not configured".to_string(),
+#[update]
+async fn embed_single_document(
+    collection_id: String,
+    document: AddDocumentRequest,
+) -> ClanopediaResult<DocumentMetadata> {
+    let caller = ic_cdk::caller();
+    let collection = storage::get_collection(&collection_id)?;
+    if !collection.admins.contains(&caller) {
+        return Err(ClanopediaError::NotAuthorized);
+    }
+    // Convert AddDocumentRequest to DocumentRequest
+    let document_request = DocumentRequest {
+        title: document.title,
+        content: document.content,
+        content_type: document.content_type,
+        source_url: document.source_url,
+        author: document.author,
+        tags: document.tags,
     };
-    format!(
-        "🟢 Clanopedia Status:\n\
-         - Canister Cycles: {}\n\
-         - Blueband Connection: {}\n\
-         - Ready for operations",
-        format_cycles(clanopedia_cycles),
-        blueband_status
-    )
+    // Add document to Blueband
+    add_document_to_blueband(&collection.blueband_collection_id, document_request)
+        .await
+        .map_err(ClanopediaError::BluebandError)
 }
 
-// Helper function to format cycles
-fn format_cycles(cycles: u64) -> String {
-    if cycles >= 1_000_000_000_000 {
-        format!("{:.1}T", cycles as f64 / 1_000_000_000_000.0)
-    } else if cycles >= 1_000_000_000 {
-        format!("{:.1}B", cycles as f64 / 1_000_000_000.0)
-    } else if cycles >= 1_000_000 {
-        format!("{:.1}M", cycles as f64 / 1_000_000.0)
-    } else {
-        format!("{}", cycles)
-    }
-}
-
-// Add missing functions
-fn validate_clanopedia_operation(_operation_type: &str) -> ClanopediaResult<()> {
-    let cycles_balance = ic_cdk::api::canister_balance();
-    if cycles_balance < MIN_CYCLES_BALANCE {
-        return Err(ClanopediaError::InsufficientCycles("Insufficient cycles".to_string()));
-    }
-    Ok(())
-}
-
-async fn can_execute_embed_proposal(
-    collection_id: &str,
-    documents: Vec<String>,
-) -> ClanopediaResult<(bool, String)> {
-    let proposal = Proposal {
-        id: "temp".to_string(),
-        collection_id: collection_id.to_string(),
-        proposal_type: ProposalType::EmbedDocument { documents: documents.clone() },
-        creator: caller(),
-        description: "".to_string(),
-        created_at: time(),
-        expires_at: time() + PROPOSAL_DURATION_NANOS,
-        status: ProposalStatus::Active,
-        votes: HashMap::new(),
-        token_votes: HashMap::new(),
-        executed: false,
-        executed_at: None,
-        executed_by: None,
-        threshold: 0,
-        threshold_met: false,
-    };
-    
-    cycles::can_execute_embed_proposal(&proposal, documents).await
-}
-
-async fn pre_execution_cycles_check(
-    collection_id: &str,
-    proposal_type: &ProposalType,
-) -> ClanopediaResult<()> {
-    let documents = match proposal_type {
-        ProposalType::EmbedDocument { documents } => documents.clone(),
-        ProposalType::BatchEmbed { document_ids } => document_ids.iter().map(|id| id.to_string()).collect(),
-        _ => vec![],
-    };
-    
-    if !documents.is_empty() {
-        let (can_execute, message) = can_execute_embed_proposal(collection_id, documents).await?;
-        if !can_execute {
-            return Err(ClanopediaError::InsufficientCycles(message));
-        }
-    }
-    
-    Ok(())
-}
-
-// Helper function to check if a user is an admin of a collection
-fn is_admin(collection_id: &str, user: Principal) -> bool {
-    match storage::get_collection(&collection_id.to_string()) {
-        Ok(collection) => collection.admins.contains(&user),
-        Err(_) => false,
-    }
-}
-
-// Helper function to get current time in nanoseconds
-fn current_time_ns() -> u64 {
-    ic_cdk::api::time()
+#[update]
+async fn get_collection_metrics_endpoint(
+    collection_id: String,
+) -> ClanopediaResult<CollectionMetrics> {
+    let collection = storage::get_collection(&collection_id)?;
+    external::blueband::get_collection_metrics(&collection.blueband_collection_id)
+        .await
+        .map_err(ClanopediaError::BluebandError)
 }
 
 // Export candid interface
 ic_cdk::export_candid!();
+
+
+
+
+

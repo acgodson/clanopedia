@@ -1,10 +1,11 @@
-// src/clanopedia_backend/src/types.rs - Fixed import conflicts
+// src/clanopedia_backend/src/types.rs
 
-use candid::{CandidType, Principal, Nat};
-use serde::{Serialize, Deserialize};
+use candid::{CandidType, Nat, Principal};
+use ic_stable_structures::storable::Storable;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use ic_stable_structures::storable::Storable;
+use crate::external::blueband::ContentType;
 
 pub type CollectionId = String;
 pub type ProposalId = String;
@@ -16,34 +17,55 @@ pub struct Collection {
     pub id: CollectionId,
     pub name: String,
     pub description: String,
+    pub creator: Principal,
+    pub created_at: u64,
+    pub updated_at: u64,
     pub admins: Vec<Principal>,
     pub threshold: u32,
     pub governance_token: Option<Principal>,
+    pub sns_governance_canister: Option<Principal>,
     pub governance_model: GovernanceModel,
-    pub genesis_owner: Principal,
-    pub members: Vec<Principal>,
-    pub blueband_collection_id: String,
-    pub cycles_balance: u64,
-    pub active_proposals: HashMap<ProposalId, Proposal>,
-    pub proposal_counter: u64,
-    pub created_at: u64,
-    pub creator: Principal,
-    pub updated_at: u64,
-    pub proposals: Vec<ProposalId>,
     pub quorum_threshold: u32,
     pub is_permissionless: bool,
+    pub blueband_collection_id: String,
+    pub proposals: HashMap<ProposalId, Proposal>,
+    pub cycles_balance: u64,
+    pub proposal_counter: u64,
+}
+
+impl Default for Collection {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            description: String::new(),
+            creator: Principal::anonymous(),
+            created_at: 0,
+            updated_at: 0,
+            admins: Vec::new(),
+            threshold: 0,
+            governance_token: None,
+            sns_governance_canister: None,
+            governance_model: GovernanceModel::Permissionless,
+            quorum_threshold: 0,
+            is_permissionless: false,
+            blueband_collection_id: String::new(),
+            proposals: HashMap::new(),
+            cycles_balance: 0,
+            proposal_counter: 0,
+        }
+    }
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CollectionConfig {
     pub name: String,
     pub description: String,
-    pub admins: Vec<Principal>,
+    pub admins: Vec<String>,
     pub threshold: u32,
-    pub governance_token: Option<Principal>,
+    pub governance_token: Option<String>,
+    pub sns_governance_canister: Option<String>,
     pub governance_model: GovernanceModel,
-    pub genesis_owner: Principal,
-    pub members: Vec<Principal>,
     pub quorum_threshold: u32,
     pub is_permissionless: bool,
 }
@@ -65,6 +87,7 @@ pub struct Proposal {
     pub executed_by: Option<Principal>,
     pub threshold: u32,
     pub threshold_met: bool,
+    pub sns_proposal_id: Option<u64>
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -76,12 +99,10 @@ pub enum Vote {
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum GovernanceModel {
-    TokenBased,
-    MemberBased,
-    AdminBased,
+    Permissionless,
     Multisig,
-    TokenWeighted,
-    Hybrid,
+    TokenBased,
+    SnsIntegrated,
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -100,7 +121,6 @@ pub enum ProposalType {
     AddAdmin { admin: Principal },
     RemoveAdmin { admin: Principal },
     ChangeThreshold { new_threshold: u32 },
-    TransferGenesis { new_genesis: Principal },
     UpdateQuorum { new_percentage: u32 },
     UpdateCollection { config: CollectionConfig },
     ChangeGovernanceModel { model: GovernanceModel },
@@ -124,6 +144,8 @@ pub enum ClanopediaError {
     Unauthorized(String),
     InvalidInput(String),
     ProposalAlreadyExecuted,
+    SnsError(String),
+    SnsNotConfigured,
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -144,7 +166,10 @@ pub struct TokenVoteCount {
 pub struct DocumentRequest {
     pub title: String,
     pub content: String,
-    pub metadata: Option<HashMap<String, String>>,
+    pub content_type: Option<ContentType>,
+    pub source_url: Option<String>,
+    pub author: Option<String>,
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
@@ -160,7 +185,9 @@ impl fmt::Display for ClanopediaError {
         match self {
             ClanopediaError::NotFound(msg) => write!(f, "Not found: {}", msg),
             ClanopediaError::NotAuthorized => write!(f, "Not authorized"),
-            ClanopediaError::InvalidProposalState(msg) => write!(f, "Invalid proposal state: {}", msg),
+            ClanopediaError::InvalidProposalState(msg) => {
+                write!(f, "Invalid proposal state: {}", msg)
+            }
             ClanopediaError::ProposalExpired => write!(f, "Proposal has expired"),
             ClanopediaError::ThresholdNotMet => write!(f, "Voting threshold not met"),
             ClanopediaError::InsufficientCycles(msg) => write!(f, "Insufficient cycles: {}", msg),
@@ -173,6 +200,8 @@ impl fmt::Display for ClanopediaError {
             ClanopediaError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
             ClanopediaError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
             ClanopediaError::ProposalAlreadyExecuted => write!(f, "Proposal already executed"),
+            ClanopediaError::SnsError(msg) => write!(f, "SNS error: {}", msg),
+            ClanopediaError::SnsNotConfigured => write!(f, "SNS not configured"),
         }
     }
 }
@@ -199,7 +228,9 @@ impl From<StorageError> for ClanopediaError {
     fn from(err: StorageError) -> Self {
         match err {
             StorageError::NotFound => ClanopediaError::NotFound("Resource not found".to_string()),
-            StorageError::AlreadyExists => ClanopediaError::AlreadyExists("Resource already exists".to_string()),
+            StorageError::AlreadyExists => {
+                ClanopediaError::AlreadyExists("Resource already exists".to_string())
+            }
             StorageError::Other(msg) => ClanopediaError::StorageError(msg),
         }
     }
@@ -222,7 +253,6 @@ pub struct BluebandConfig {
 
 // Constants
 pub const PROPOSAL_DURATION_NANOS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000; // 7 days
-pub const MIN_CYCLES_BALANCE: u64 = 1_000_000_000; // 1B cycles minimum
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct GovernanceModelConfig {
@@ -234,7 +264,7 @@ pub struct GovernanceModelConfig {
 
 impl Default for GovernanceModel {
     fn default() -> Self {
-        GovernanceModel::MemberBased
+        GovernanceModel::Permissionless
     }
 }
 
@@ -283,48 +313,47 @@ impl Storable for Proposal {
             executed_by: None,
             threshold: 0,
             threshold_met: false,
+            sns_proposal_id: None
         })
     }
 
-    const BOUND: ic_stable_structures::storable::Bound = 
-    ic_stable_structures::storable::Bound::Bounded {
-        max_size: 1024 * 1024, // 1MB max size for a proposal
-        is_fixed_size: false,
-    };
+    const BOUND: ic_stable_structures::storable::Bound =
+        ic_stable_structures::storable::Bound::Bounded {
+            max_size: 1024 * 1024, // 1MB max size for a proposal
+            is_fixed_size: false,
+        };
 }
 
 impl Storable for Collection {
-fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
-    std::borrow::Cow::Owned(candid::encode_one(self).unwrap())
-}
+    fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
+        std::borrow::Cow::Owned(candid::encode_one(self).unwrap())
+    }
 
-fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
-    candid::decode_one(&bytes).unwrap_or_else(|_| Collection {
-        id: String::new(),
-        name: String::new(),
-        description: String::new(),
-        admins: Vec::new(),
-        threshold: 0,
-        governance_token: None,
-        governance_model: GovernanceModel::MemberBased,
-        genesis_owner: Principal::anonymous(),
-        members: Vec::new(),
-        blueband_collection_id: String::new(),
-        cycles_balance: 0,
-        active_proposals: HashMap::new(),
-        proposal_counter: 0,
-        created_at: 0,
-        creator: Principal::anonymous(),
-        updated_at: 0,
-        proposals: Vec::new(),
-        quorum_threshold: 0,
-        is_permissionless: false,
-    })
-}
+    fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
+        candid::decode_one(&bytes).unwrap_or_else(|_| Collection {
+            id: String::new(),
+            name: String::new(),
+            description: String::new(),
+            creator: Principal::anonymous(),
+            created_at: 0,
+            updated_at: 0,
+            admins: Vec::new(),
+            threshold: 0,
+            governance_token: None,
+            sns_governance_canister: None,
+            governance_model: GovernanceModel::Permissionless,
+            quorum_threshold: 0,
+            is_permissionless: false,
+            blueband_collection_id: String::new(),
+            proposals: HashMap::new(),
+            cycles_balance: 0,
+            proposal_counter: 0,
+        })
+    }
 
-const BOUND: ic_stable_structures::storable::Bound = 
-    ic_stable_structures::storable::Bound::Bounded {
-        max_size: 2 * 1024 * 1024, // 2MB max size for a collection
-        is_fixed_size: false,
-    };
+    const BOUND: ic_stable_structures::storable::Bound =
+        ic_stable_structures::storable::Bound::Bounded {
+            max_size: 2 * 1024 * 1024, // 2MB max size for a collection
+            is_fixed_size: false,
+        };
 }

@@ -1,2 +1,19 @@
 [registries]
-ic = { index = "https://github.com/dfinity/ic-registry.git" } 
+ic = { index = "https://github.com/dfinity/ic-registry.git" }
+
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+atomics,+bulk-memory,+mutable-globals"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+build-std-features = ["panic_immediate_abort"]
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1 

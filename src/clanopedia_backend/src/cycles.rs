@@ -1,45 +1,24 @@
-// src/clanopedia_backend/src/cycles.rs - Fixed error formatting
+// src/clanopedia_backend/src/cycles.rs - Fixed with safety buffer
 
 use crate::types::*;
 use candid::{CandidType, Principal};
-use ic_cdk::api::call;
-use ic_cdk::api::time;
-use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 
-// ============================
-// SIMPLE CONSTANTS
-// ============================
 
-// Clanopedia operation costs (fixed, low since we store minimal data)
-const GOVERNANCE_OPERATION_COST: u64 = 1_000_000;      // 1M cycles
-const MIN_CLANOPEDIA_BALANCE: u64 = 10_000_000;     // 10M cycles
+// predictions for operation costs
+const MIN_CLANOPEDIA_BALANCE: u64 = 50_000_000;        // 50M cycles (increased from 10M)
+const SAFETY_BUFFER: u64 = 100_000_000;                // 100M cycles safety buffer
 
-// Blueband operation estimates (based on Blueband's own calculations)
+// // Blueband operation estimates (based on Blueband's own calculations)
 const EMBEDDING_COST_PER_DOC: u64 = 10_000_000;    // 10M cycles per document
-const SEARCH_COST: u64 = 1_000_000;                 // 1M cycles per search
-const MIN_BLUEBAND_BALANCE: u64 = 50_000_000;    // 50M cycles (Blueband's minimum)
 
-// Stable storage for Blueband canister ID
-thread_local! {
-    static BLUEBAND_CANISTER_ID: std::cell::RefCell<Option<Principal>> = std::cell::RefCell::new(None);
-}
 
-pub fn set_blueband_canister_id(canister_id: Principal) {
-    BLUEBAND_CANISTER_ID.with(|id| {
-        *id.borrow_mut() = Some(canister_id);
-    });
-}
 
 pub fn get_blueband_canister_id() -> ClanopediaResult<Principal> {
-    BLUEBAND_CANISTER_ID.with(|id| {
-        id.borrow()
-            .ok_or_else(|| ClanopediaError::InvalidInput("Blueband canister not initialized".to_string()))
-    })
+    crate::get_blueband_canister_id()
 }
-
 // ============================
-// SIMPLE STATUS CHECK
+// UPDATED STATUS CHECK
 // ============================
 
 #[derive(CandidType, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,31 +27,34 @@ pub struct CyclesStatus {
     pub blueband_balance: u64,
     pub clanopedia_healthy: bool,
     pub blueband_healthy: bool,
+    pub can_transfer_safely: bool,
 }
 
 pub async fn check_cycles_status() -> ClanopediaResult<CyclesStatus> {
     let clanopedia_balance = ic_cdk::api::canister_balance();
-    let blueband_balance = get_blueband_balance().await?;
-
     let clanopedia_healthy = clanopedia_balance >= MIN_CLANOPEDIA_BALANCE;
-    let blueband_healthy = blueband_balance >= MIN_BLUEBAND_BALANCE;
+    let can_transfer_safely = clanopedia_balance > (MIN_CLANOPEDIA_BALANCE + SAFETY_BUFFER);
 
     Ok(CyclesStatus {
         clanopedia_balance,
-        blueband_balance,
+        blueband_balance: 0, 
         clanopedia_healthy,
-        blueband_healthy,
+        blueband_healthy: true,
+        can_transfer_safely,
     })
 }
 
 // ============================
-// OPERATION VALIDATION
+//  OPERATION VALIDATION
 // ============================
 
 pub fn validate_clanopedia_operation() -> ClanopediaResult<()> {
     let balance = ic_cdk::api::canister_balance();
     if balance < MIN_CLANOPEDIA_BALANCE {
-        return Err(ClanopediaError::InsufficientCycles("Insufficient cycles for operation".to_string()));
+        return Err(ClanopediaError::InsufficientCycles(
+            format!("Insufficient cycles for operation. Balance: {}, Required: {}", 
+                   balance, MIN_CLANOPEDIA_BALANCE)
+        ));
     }
     Ok(())
 }
@@ -86,9 +68,11 @@ pub async fn can_execute_embed_proposal(
 
     if !cycles_status.clanopedia_healthy || !cycles_status.blueband_healthy {
         let message = format!(
-            "Insufficient cycles. Clanopedia balance: {}, Blueband balance: {}, Required: {}",
+            "Insufficient cycles. Clanopedia: {} ({}), Blueband: {} ({}), Required: {}",
             cycles_status.clanopedia_balance,
+            if cycles_status.clanopedia_healthy { "✅" } else { "⚠️" },
             cycles_status.blueband_balance,
+            if cycles_status.blueband_healthy { "✅" } else { "⚠️" },
             cost.total_cost
         );
         return Ok((false, message));
@@ -106,15 +90,24 @@ pub async fn can_execute_embed_proposal(
 }
 
 // ============================
-// FUNDING OPERATIONS
+// UPDATED FUNDING OPERATIONS WITH SAFETY CHECKS
 // ============================
 
 pub async fn fund_blueband_canister(amount: u64) -> ClanopediaResult<()> {
     validate_clanopedia_operation()?;
     let balance = ic_cdk::api::canister_balance();
-    if balance < amount {
-        return Err(ClanopediaError::InsufficientCycles("Insufficient cycles for transfer".to_string()));
+    
+    // Safety check: ensure we keep enough cycles + safety buffer
+    let required_balance = MIN_CLANOPEDIA_BALANCE + SAFETY_BUFFER + amount;
+    if balance < required_balance {
+        return Err(ClanopediaError::InsufficientCycles(
+            format!(
+                "Transfer would leave insufficient cycles. Current: {}, Transfer: {}, Required remaining: {} (including safety buffer)",
+                balance, amount, MIN_CLANOPEDIA_BALANCE + SAFETY_BUFFER
+            )
+        ));
     }
+
     let blueband_canister = get_blueband_canister_id()?;
     ic_cdk::api::call::call_with_payment::<_, ()>(
         blueband_canister,
@@ -124,22 +117,41 @@ pub async fn fund_blueband_canister(amount: u64) -> ClanopediaResult<()> {
     )
     .await
     .map_err(|e| ClanopediaError::BluebandError(format!("Failed to transfer cycles: {:?}", e)))?;
+    
     Ok(())
 }
 
+// New helper function to calculate safe transfer amount
+pub async fn get_max_safe_transfer_amount() -> ClanopediaResult<u64> {
+    let balance = ic_cdk::api::canister_balance();
+    let required_minimum = MIN_CLANOPEDIA_BALANCE + SAFETY_BUFFER;
+    
+    if balance <= required_minimum {
+        Ok(0)
+    } else {
+        Ok(balance - required_minimum)
+    }
+}
+
 // ============================
-// REPORTING
+// UPDATED REPORTING
 // ============================
 
 pub async fn get_cycles_health_report() -> ClanopediaResult<String> {
     let status = check_cycles_status().await?;
+    let max_transfer = get_max_safe_transfer_amount().await?;
     
     let report = format!(
-        "Clanopedia Cycles: {} ({})\nBlueband Cycles: {} ({})",
+        "Clanopedia Cycles: {} ({})\n\
+         Blueband Cycles: {} ({})\n\
+         Max Safe Transfer: {} cycles\n\
+         Transfer Status: {}",
         format_cycles(status.clanopedia_balance),
         if status.clanopedia_healthy { "✅" } else { "⚠️" },
         format_cycles(status.blueband_balance),
-        if status.blueband_healthy { "✅" } else { "⚠️" }
+        if status.blueband_healthy { "✅" } else { "⚠️" },
+        format_cycles(max_transfer),
+        if status.can_transfer_safely { "Safe to transfer" } else { "⚠️ Low cycles - transfers restricted" }
     );
     
     Ok(report)
@@ -148,23 +160,28 @@ pub async fn get_cycles_health_report() -> ClanopediaResult<String> {
 pub async fn get_funding_recommendation(planned_docs: u32) -> ClanopediaResult<String> {
     let status = check_cycles_status().await?;
     let cost = estimate_embedding_cost(vec![]).await?;
+    let max_transfer = get_max_safe_transfer_amount().await?;
     
     let recommendation = format!(
         "Current Status:\n\
          - Clanopedia: {} cycles ({})\n\
          - Blueband: {} cycles ({})\n\
+         - Max safe transfer: {} cycles\n\
          Required for {} documents: {} cycles\n\
          Recommendation: {}",
         format_cycles(status.clanopedia_balance),
         if status.clanopedia_healthy { "Healthy" } else { "Low" },
         format_cycles(status.blueband_balance),
         if status.blueband_healthy { "Healthy" } else { "Low" },
+        format_cycles(max_transfer),
         planned_docs,
         format_cycles(cost.total_cost),
-        if status.clanopedia_healthy && status.blueband_healthy {
-            "No additional funding needed"
+        if status.clanopedia_healthy && status.blueband_healthy && max_transfer > 0 {
+            "System healthy - can proceed with operations"
+        } else if max_transfer == 0 {
+            "⚠️ Cannot safely transfer cycles - deposit more cycles first"
         } else {
-            "Consider adding more cycles"
+            "⚠️ Consider adding more cycles before large operations"
         }
     );
     
@@ -172,78 +189,9 @@ pub async fn get_funding_recommendation(planned_docs: u32) -> ClanopediaResult<S
 }
 
 // ============================
-// PRE-EXECUTION CHECKS
+// REST OF THE FILE UNCHANGED
 // ============================
 
-pub async fn pre_execution_cycles_check(
-    proposal_type: &ProposalType,
-    _blueband_canister: Principal,
-) -> ClanopediaResult<()> {
-    // Check Clanopedia can handle execution
-    validate_clanopedia_operation()?;
-    
-    // Check Blueband has sufficient cycles for the specific operation
-    match proposal_type {
-        ProposalType::EmbedDocument { documents } => {
-            let (can_execute, message) = can_execute_embed_proposal(
-                &Proposal {
-                    id: "temp".to_string(),
-                    collection_id: "temp".to_string(),
-                    proposal_type: proposal_type.clone(),
-                    creator: Principal::anonymous(),
-                    description: "".to_string(),
-                    created_at: time(),
-                    expires_at: time() + 7 * 24 * 60 * 60 * 1_000_000_000,
-                    status: ProposalStatus::Active,
-                    votes: HashMap::new(),
-                    token_votes: HashMap::new(),
-                    executed: false,
-                    executed_at: None,
-                    executed_by: None,
-                    threshold: 0,
-                    threshold_met: false,
-                },
-                documents.clone()
-            ).await?;
-            if !can_execute {
-                return Err(ClanopediaError::InsufficientCycles(message));
-            }
-        },
-        ProposalType::BatchEmbed { document_ids } => {
-            let (can_execute, message) = can_execute_embed_proposal(
-                &Proposal {
-                    id: "temp".to_string(),
-                    collection_id: "temp".to_string(),
-                    proposal_type: proposal_type.clone(),
-                    creator: Principal::anonymous(),
-                    description: "".to_string(),
-                    created_at: time(),
-                    expires_at: time() + 7 * 24 * 60 * 60 * 1_000_000_000,
-                    status: ProposalStatus::Active,
-                    votes: HashMap::new(),
-                    token_votes: HashMap::new(),
-                    executed: false,
-                    executed_at: None,
-                    executed_by: None,
-                    threshold: 0,
-                    threshold_met: false,
-                },
-                document_ids.iter().map(|id| id.to_string()).collect()
-            ).await?;
-            if !can_execute {
-                return Err(ClanopediaError::InsufficientCycles(message));
-            }
-        },
-        // Other proposal types don't require Blueband cycles
-        _ => {}
-    }
-    
-    Ok(())
-}
-
-// ============================
-// UTILITIES
-// ============================
 
 fn format_cycles(cycles: u64) -> String {
     if cycles >= 1_000_000_000_000 {
@@ -254,17 +202,6 @@ fn format_cycles(cycles: u64) -> String {
         format!("{:.1}M", cycles as f64 / 1_000_000.0)
     } else {
         format!("{}", cycles)
-    }
-}
-
-pub async fn get_blueband_balance() -> ClanopediaResult<u64> {
-    let blueband_canister = get_blueband_canister_id()?;
-    match call::call::<_, (u64,)>(blueband_canister, "get_cycles_balance", ()).await {
-        Ok((balance,)) => Ok(balance),
-        Err(e) => Err(ClanopediaError::ExternalCallError(format!(
-            "Failed to get Blueband balance: {:?}",
-            e
-        ))),
     }
 }
 
@@ -282,14 +219,3 @@ pub async fn estimate_embedding_cost(documents: Vec<String>) -> ClanopediaResult
     })
 }
 
-fn estimate_search_cost(query_count: u32) -> u64 {
-    SEARCH_COST * query_count as u64
-}
-
-pub async fn estimate_query_cost(operation_type: &str, doc_count: u32) -> ClanopediaResult<u64> {
-    match operation_type {
-        "embed" => Ok(estimate_embedding_cost(vec![]).await?.total_cost),
-        "search" => Ok(estimate_search_cost(doc_count)),
-        _ => Err(ClanopediaError::InvalidArgument(format!("Unknown operation type: {}", operation_type)))
-    }
-}

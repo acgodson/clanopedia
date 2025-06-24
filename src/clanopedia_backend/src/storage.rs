@@ -1,11 +1,11 @@
-// src/clanopedia_backend/src/storage.rs - Final fix removing duplicate Storable implementation
+// src/clanopedia_backend/src/storage.rs
 
 use crate::types::*;
 use candid::Principal;
 use ic_cdk::api::time;
 use ic_stable_structures::{
     memory_manager::{MemoryId, MemoryManager, VirtualMemory},
-    DefaultMemoryImpl, StableBTreeMap, Storable,
+    DefaultMemoryImpl, StableBTreeMap,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ thread_local! {
         )
     );
 
-    static PROPOSALS: RefCell<StableBTreeMap<(CollectionId, ProposalId), Proposal, Memory>> = RefCell::new(
+    static PROPOSALS: RefCell<StableBTreeMap<String, Proposal, Memory>> = RefCell::new(
         StableBTreeMap::init(
             MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(1)))
         )
@@ -40,7 +40,7 @@ thread_local! {
 
 pub fn create_collection(
     collection_id: &CollectionId,
-    config: CollectionConfig,
+    mut config: CollectionConfig,
     creator: Principal,
 ) -> ClanopediaResult<()> {
     if COLLECTIONS.with(|c| c.borrow().contains_key(collection_id)) {
@@ -50,24 +50,45 @@ pub fn create_collection(
         )));
     }
 
+    // Convert string representations to Principal objects
+    let admins: Result<Vec<Principal>, _> = config
+        .admins
+        .into_iter()
+        .map(Principal::from_text)
+        .collect();
+
+    let governance_token = config
+        .governance_token
+        .map(Principal::from_text)
+        .transpose()
+        .map_err(|e| {
+            ClanopediaError::InvalidInput(format!("Invalid governance token principal: {}", e))
+        })?;
+
+    let sns_governance_canister = config
+        .sns_governance_canister
+        .map(Principal::from_text)
+        .transpose()
+        .map_err(|e| {
+            ClanopediaError::InvalidInput(format!("Invalid SNS governance canister principal: {}", e))
+        })?;
+
     let collection = Collection {
         id: collection_id.clone(),
         name: config.name,
         description: config.description,
-        admins: config.admins,
+        admins: admins.unwrap_or_else(|_| vec![creator]), // Fall back to just the creator if any principal is invalid
         threshold: config.threshold,
-        governance_token: config.governance_token,
+        governance_token,
+        sns_governance_canister,
         governance_model: config.governance_model,
-        genesis_owner: config.genesis_owner,
-        members: config.members,
-        blueband_collection_id: String::new(), // Set by Blueband interface
+        blueband_collection_id: String::new(),
         cycles_balance: 0,
-        active_proposals: HashMap::new(),
+        proposals: HashMap::new(),
         proposal_counter: 0,
         created_at: time(),
         creator,
         updated_at: time(),
-        proposals: Vec::new(),
         quorum_threshold: config.quorum_threshold,
         is_permissionless: config.is_permissionless,
     };
@@ -115,10 +136,10 @@ pub fn delete_collection(collection_id: &CollectionId) -> ClanopediaResult<()> {
     }
 
     // Delete all proposals for this collection
-    let proposal_keys: Vec<(CollectionId, ProposalId)> = PROPOSALS.with(|p| {
+    let proposal_keys: Vec<String> = PROPOSALS.with(|p| {
         p.borrow()
             .iter()
-            .filter(|((cid, _), _)| cid == collection_id)
+            .filter(|(key, _)| key.starts_with(&format!("{}:", collection_id)))
             .map(|(k, _)| k.clone())
             .collect()
     });
@@ -150,106 +171,23 @@ pub fn list_collections() -> Vec<Collection> {
 // PROPOSAL OPERATIONS
 // ============================
 
-pub fn store_proposal(collection_id: &CollectionId, proposal: &Proposal) -> ClanopediaResult<()> {
-    if !COLLECTIONS.with(|c| c.borrow().contains_key(collection_id)) {
-        return Err(ClanopediaError::NotFound(format!(
-            "Collection {} not found",
-            collection_id
-        )));
-    }
-
-    let key = (collection_id.clone(), proposal.id.clone());
-    PROPOSALS.with(|p| {
-        p.borrow_mut().insert(key, proposal.clone());
-    });
-
-    // Update collection's active proposals
-    let mut collection = get_collection(collection_id)?;
-    collection
-        .active_proposals
-        .insert(proposal.id.clone(), proposal.clone());
-    update_collection(collection_id, &collection)?;
-
-    Ok(())
-}
-
-pub fn get_proposal_by_collection_and_id(
-    collection_id: &CollectionId,
-    proposal_id: &ProposalId,
-) -> ClanopediaResult<Proposal> {
-    let key = (collection_id.clone(), proposal_id.clone());
-    PROPOSALS.with(|p| {
-        p.borrow().get(&key).ok_or_else(|| {
-            ClanopediaError::NotFound(format!(
-                "Proposal {} not found in collection {}",
-                proposal_id, collection_id
-            ))
-        })
-    })
-}
-
 pub fn update_proposal_in_storage(
     collection_id: &CollectionId,
     proposal: &Proposal,
 ) -> ClanopediaResult<()> {
-    let key = (collection_id.clone(), proposal.id.clone());
-    if !PROPOSALS.with(|p| p.borrow().contains_key(&key)) {
-        return Err(ClanopediaError::NotFound(format!(
-            "Proposal {} not found in collection {}",
-            proposal.id, collection_id
-        )));
-    }
-
-    PROPOSALS.with(|p| {
-        p.borrow_mut().insert(key, proposal.clone());
-    });
-
-    // Update collection's active proposals
     let mut collection = get_collection(collection_id)?;
+
+    // Update or remove proposal based on status
     if proposal.status == ProposalStatus::Executed
         || proposal.status == ProposalStatus::Rejected
         || proposal.status == ProposalStatus::Expired
     {
-        collection.active_proposals.remove(&proposal.id);
+        collection.proposals.remove(&proposal.id);
     } else {
         collection
-            .active_proposals
+            .proposals
             .insert(proposal.id.clone(), proposal.clone());
     }
-    update_collection(collection_id, &collection)?;
 
-    Ok(())
+    update_collection(collection_id, &collection)
 }
-
-pub fn list_proposals(collection_id: &CollectionId) -> Vec<Proposal> {
-    PROPOSALS.with(|p| {
-        p.borrow()
-            .iter()
-            .filter(|((cid, _), _)| cid == collection_id)
-            .map(|(_, proposal)| proposal)
-            .collect()
-    })
-}
-
-pub fn list_active_proposals(collection_id: &CollectionId) -> Vec<Proposal> {
-    PROPOSALS.with(|p| {
-        p.borrow()
-            .iter()
-            .filter(|((cid, _), proposal)| {
-                cid == collection_id && proposal.status == ProposalStatus::Active
-            })
-            .map(|(_, proposal)| proposal)
-            .collect()
-    })
-}
-
-// Helper functions for proposal expiry
-pub fn is_proposal_expired(proposal: &Proposal) -> bool {
-    ic_cdk::api::time() > proposal.expires_at
-}
-
-// ============================
-// STORABLE IMPLEMENTATIONS
-// ============================
-
-// Note: Collection and Proposal Storable implementations are in types.rs to avoid conflicts
